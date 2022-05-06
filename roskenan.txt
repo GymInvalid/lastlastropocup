@@ -1,0 +1,346 @@
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+#движение по черной линии маркер + текст
+
+import sys
+import rospy
+from std_msgs.msg import Float64
+import cv2 as cv
+import numpy as np
+import time
+
+percent = 100
+
+
+class following:
+
+    def __init__(self):
+        self.angle = rospy.Publisher("/autoware_gazebo/steering_angle", Float64, queue_size=1)
+        self.speed = rospy.Publisher("/autoware_gazebo/velocity", Float64, queue_size=1)
+        
+        self.old_error = 0.0
+        self.old_centerRoad = -1
+
+        self.cap = cv.VideoCapture(0, cv.CAP_V4L2)
+        self.cap.set(3, 320)
+        self.cap.set(4, 240)
+        #self.cap.set(5, 30)
+        if self.cap.isOpened() == False:
+            rospy.signal_shutdown("Can`t open video source")
+        #rospy.Timer(rospy.Duration(1/30.0), self.update)
+
+    def stop(self):
+        self.speed.publish(0.0)
+
+    def update(self, poligon):
+        pix_str = 220
+        i = 0
+        cnt = -1
+        st, et = 0, 0
+        
+        height, width, _ = poligon.shape
+        bin_img = poligon[:, :, 2]
+        while i < width:
+                if bin_img[pix_str, i] < 85:
+                        start_idx = i
+                        for j in range(i+1, width):
+                                i = j
+                                if bin_img[pix_str, j] > 85:
+                                        break
+                        end_idx = i
+                        if end_idx - start_idx >= 20:
+                                center = (end_idx + start_idx) // 2
+                                if self.old_centerRoad != -1:
+                                        if abs(center - self.old_centerRoad) <= abs(self.old_centerRoad - cnt):
+                                                st = start_idx
+                                                et = end_idx
+                                                cnt = center
+                                else:
+                                        st = start_idx
+                                        et = end_idx
+                                        cnt = center
+                i += 1
+
+
+        #print(cnt)
+        print(et - st)
+        if (et - st) > 80: cnt = self.old_centerRoad
+        poligon = cv.circle(poligon, (int(cnt), pix_str), 10, 122, -1)  # 5-радиус, далее цвет и толщина линии (-1 залить круг)
+        self.old_centerRoad = cnt
+        error = 160.0 - float(cnt)
+        kp = 0.2
+        kd = 0.2
+        P = error * kp
+        D = (error-self.old_error) * kd
+        ang = int(90.0 + P + D)
+        if ang > 120: ang = 120
+        if ang < 60: ang = 60
+        #ang = 90
+        self.angle.publish(ang)
+        #self.speed.publish(2.1)
+        #cv.imshow("imageOriginal", poligon)
+        #cv.waitKey(1) 
+
+
+import time
+
+def main(args):
+    rospy.init_node('following_line', anonymous=True)
+    ic = following()
+    
+    start_t = -1
+    react_t = -1
+    go_t = -1
+    start_is = True
+    
+    stop_is = False
+    blue_is = False
+    road_is = False
+    back_is = False
+    
+    back_status = 0
+    
+    hsv_min_tr = np.array((0, 0, 0), np.uint8)
+    hsv_max_tr = np.array((180, 255, 30), np.uint8)
+    
+    red_t = False
+    
+    while not rospy.is_shutdown():
+        if start_is:
+            if go_t == -1: go_t = time.time()
+            if (time.time() - go_t) <= 0.5:
+                ic.speed.publish(2.5)
+            else: ic.speed.publish(2.0)
+        else: go_t = -1
+        
+        if red_t: ic.speed.publish(0.0)
+        
+        ret, frame = ic.cap.read()
+        width = int(frame.shape[1] * percent) / 100
+        height = int(frame.shape[0] * percent) / 100
+        if not ret: break
+        #print(width, height)
+
+        frame = cv.resize(frame, (int(width), int(height)))
+        #cv.imshow('1', frame)
+        #cv.waitKey(0)
+
+        ic.update(frame)
+
+        x_roi1 = width/2
+        y_roi1 = height/3
+
+        x_roi2 = x_roi1 + (160 * percent)/100
+        y_roi2 = y_roi1 + (85 * percent)/100
+
+        frame_lit = frame[int(y_roi1): int(y_roi2), int(x_roi1): int(x_roi2)]
+
+        search_obj = cv.rectangle(frame, (int(x_roi1), int(y_roi1)), (int(x_roi2), int(y_roi2)), (0,255,0), 2)
+
+        cv.imshow("frame", search_obj)
+        
+        hsv = cv.cvtColor(frame_lit, cv.COLOR_BGR2HSV)  # Перевод массива кадров в hsv градацию
+        #cv.imshow("hsv", hsv)  # обработанный вариант
+
+        hsv_blur = cv.blur(hsv, (3, 3))
+
+        kernel = np.ones((3, 3), "uint8")
+        
+        minH = 0
+        minS = 82
+        minV = 25
+        maxH = 197
+        maxS = 227
+        maxV = 255
+        
+        bin_vid_blur = cv.inRange(hsv_blur, (minH, minS, minV), (maxH, maxS, maxV))
+        bin_tr = cv.inRange(hsv_blur, hsv_min_tr, hsv_max_tr)
+        
+        bin_vid_blur = cv.bitwise_or(bin_tr, bin_vid_blur)
+        
+        erode = cv.erode(bin_vid_blur, kernel, iterations=1)
+        #cv.imshow("Erode", erode)
+        
+        dilate = cv.dilate(erode, kernel, iterations=1)
+        #cv.imshow("Dilate", dilate)
+
+        contours = cv.findContours(dilate, cv.RETR_LIST, cv.CHAIN_APPROX_SIMPLE)
+        contours = contours[0]
+                                
+        #cv.imshow("color", search_obj_color)
+        
+        for i in contours:
+                cont_area = cv.contourArea(i)
+                #print(cont_area)
+
+                rect = cv.boundingRect(i)
+                x, y, w, h = rect
+                prop = float(rect[2])/float(rect[3])
+                #print(cont_area)
+                if cont_area > 150:
+                        search_obj_color = cv.resize(frame_lit[y:(y + h), x:(x + w)], (32, 32))
+                        color_red, color_blue = 0, 0
+                        color_black = 0
+                        
+                        
+                        for n in range(0, search_obj_color.shape[0]):  
+                                for j in range(0, search_obj_color.shape[1]):
+                                        if (float(search_obj_color[n, j, 2]) > (float(search_obj_color[n, j, 1]) + float(search_obj_color[n, j, 0])) * 0.7):  # img_roiColor[n, j, 2] > (img_roiColor[n, j, 1] + img_roiColor[n, j, 0]) * 0.7
+                                                color_red = color_red + 1
+                                        if ((float(search_obj_color[n, j, 0]) - max([float(search_obj_color[n, j, 1]), float(search_obj_color[n, j, 2])])) > 10):
+                                                color_blue = color_blue + 1
+                                        if (search_obj_color[n, j, 2] < 60 and search_obj_color[n, j, 1] < 60 \
+                                            and search_obj_color[n, j, 0] < 60):
+                                                color_black += 1
+                        count_pixel_img = float(search_obj_color.shape[0] * search_obj_color.shape[1]) #обозначим тип данных float, т.к. python второй версии все в int переводит и при подсчете процентов получаем 0 
+                        color_red = float(color_red) / count_pixel_img * 100.0
+                        color_blue = float(color_blue) / count_pixel_img * 100.0
+                        color_black = float(color_black) / count_pixel_img * 100.0
+                                
+                        #print(prop)
+                        #print('color: ', color_red, color_blue)
+                        if (prop > 0.65 and prop < 1.35):
+                                perimetr = 0.02 * cv.arcLength(i, True)
+                                approx = cv.approxPolyDP(i, perimetr, True)
+                                #print('approx: ', len(approx))
+                                #print (color_red, color_blue)
+                                
+                                x_r = rect[0]
+                                y_r = rect[1]
+                                if color_red < 13.0 and color_blue > 55.0 and (len(approx) >= 4 and len(approx) <= 9):
+                                    blue_is = True
+                                    search_cont = cv.rectangle(frame[int(y_roi1): int(y_roi2), int(x_roi1): int(x_roi2)], (int(x_r), int(y_r)), (int(x_r+rect[2]), int(y_r+rect[3])), (255, 0, 0), 2)
+                                
+                                if color_red > 10.0 and color_red < 30.0 and color_blue < 10.0 and (len(approx) >= 3 and len(approx) <= 6):
+                                    road_is = True
+                                    search_cont = cv.rectangle(frame[int(y_roi1): int(y_roi2), int(x_roi1): int(x_roi2)], (int(x_r), int(y_r)), (int(x_r+rect[2]), int(y_r+rect[3])), (0, 0, 255), 2)
+                                    
+                                if color_red > 10.0 and color_red < 30.0 and color_blue < 10.0 and (len(approx) >= 8 and len(approx) <= 15):
+                                    back_is = True
+                                    search_cont = cv.rectangle(frame[int(y_roi1): int(y_roi2), int(x_roi1): int(x_roi2)], (int(x_r), int(y_r)), (int(x_r+rect[2]), int(y_r+rect[3])), (0, 0, 255), 2)
+                                    
+                                if color_red > 40.0 and color_blue < 13.0 and len(approx) == 8:
+                                    stop_is = True
+                                    #print('signnnnnnn stoooooop')
+                                    search_cont = cv.rectangle(frame[int(y_roi1): int(y_roi2), int(x_roi1): int(x_roi2)], \
+                                                               (int(x_r), int(y_r)), (int(x_r+rect[2]), int(y_r+rect[3])), (0, 0, 255), 2)
+        
+                        #print('traffic light ', prop, color_black)
+                        if (prop >= 0.2 and prop <= 0.75) and color_black > 50.0:
+                            col = search_obj_color.shape[1] // 2
+                            white_px = 0
+                            white_offset = 0
+                            for offset in range(0, search_obj_color.shape[0]):
+                                if search_obj_color[offset, col, 1] > 80 or search_obj_color[offset, col, 0] > 80 \
+                                   or search_obj_color[offset, col, 2] > 80:
+                                    white_px += 1
+                                    white_offset += offset
+                                    
+                            #print(white_px)
+                            if white_px < 5: continue
+                            #print(white_px)
+                            light_pos = (float(white_offset) / float(white_px)) / float(search_obj_color.shape[0])
+                            
+                            if light_pos > 0.0 and light_pos < 0.55:
+                                start_is = False
+                                red_t = True
+                                print('red')
+                                #search_cont = cv.rectangle(frame[int(y_roi1): int(y_roi2), int(x_roi1): int(x_roi2)], \
+                                #                               (int(x_r), int(y_r)), (int(x_r+rect[2]), int(y_r+rect[3])), (0, 127, 255), 2)
+
+                               
+                            if light_pos > 0.55 and light_pos < 0.85:
+                                red_t = False
+                                start_is = True
+                                print('green')
+                                #search_cont = cv.rectangle(frame[int(y_roi1): int(y_roi2), int(x_roi1): int(x_roi2)], \
+                                #                               (int(x_r), int(y_r)), (int(x_r+rect[2]), int(y_r+rect[3])), (0, 127, 255), 2)
+                              
+        react_t = time.time()
+        if react_t == -1 or (time.time() - react_t) > 10.0:
+            if blue_is:
+                if start_t == -1:
+                    start_is = False
+                    ic.speed.publish(2.8)
+                    start_t = time.time()
+                if start_t != -1:
+                    el = time.time() - start_t
+                    if el >= 2.0:
+                        react_t = time.time()
+                        blue_is = False
+                        start_t = -1
+                        #print('gooooooooooo')
+                        start_is = True    
+            
+            elif stop_is:
+                if start_t == -1:
+                    start_is = False
+                    ic.speed.publish(0.0)
+                    start_t = time.time()
+                if start_t != -1:
+                    el = time.time() - start_t
+                    if el >= 2.0:
+                        react_t = time.time()
+                        stop_is = False
+                        start_t = -1
+                        #print('gooooooooooo')
+                        start_is = True
+                        
+            elif road_is:
+                if start_t == -1:
+                    start_is = False
+                    ic.speed.publish(1.5)
+                    start_t = time.time()
+                if start_t != -1:
+                    el = time.time() - start_t
+                    if el >= 2.0:
+                        react_t = time.time()
+                        road_is = False
+                        start_t = -1
+                        #print('gooooooooooo')
+                        start_is = True
+                        
+            elif back_is:
+                if start_t == -1:
+                    start_is = False
+                    ic.speed.publish(-2.3)
+                    start_t = time.time()
+                if start_t != -1:
+                    el = time.time() - start_t
+                    if el >= 1.0:
+                        react_t = time.time()
+                        back_is = False
+                        start_t = -1
+                        back_status = 1
+                        #print('gooooooooooo')
+                        #start_is = True
+                        
+        if back_status == 1:
+            if start_t == -1:
+                start_is = False
+                ic.speed.publish(0.0)
+                start_t = time.time()
+            if start_t != -1:
+                el = time.time() - start_t
+                if el >= 2.0:
+                    react_t = time.time()
+                    back_is = False
+                    start_t = -1
+                    back_status = 0
+                    #print('gooooooooooo')
+                    start_is = True
+                        
+        #cv.imshow("contur", frame_lit)
+        cv.waitKey(1)
+        # print(cont_area)
+        # print(perimetr)
+	#try:
+        
+    ic.stop()
+    #rospy.spin()
+    #except KeyboardInterrupt:
+    #    ic.stop()
+    cv.destroyAllWindows()
+
+if __name__ == '__main__':
+    main(sys.argv)
